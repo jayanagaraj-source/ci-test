@@ -3,9 +3,10 @@
 # Runs the TigerGate CLI container against this repository and uploads the
 # results to the TigerGate staging environment.
 #
-# This workflow only scans the repository as checked out: it does not install
-# dependencies, build, or provision any language toolchain. SCA reads the
-# committed manifests (package.json / package-lock.json) directly.
+# This workflow scans the repository as checked out; it does not build or
+# install node_modules. SCA reads the committed manifests directly. The only
+# exception: if package.json exists with no lockfile, a package-lock.json is
+# generated (lockfile only, no install scripts) so SCA sees exact versions.
 #
 # The CLI image is fully driven by workflow inputs (cli_image / cli_tag), so a
 # custom or private build can be tested by dispatching with different values --
@@ -100,6 +101,50 @@ jobs:
         # Printed before the scan so the exact CLI build under test is recorded
         # in the job log.
         run: tigergate --version
+
+      - name: Generate package-lock.json if missing
+        # SCA needs a lockfile to see exact and transitive npm dependency
+        # versions; package.json alone only gives ranges. When the repo commits
+        # package.json without any lockfile, resolve one here.
+        #
+        # --package-lock-only writes the lockfile without downloading
+        # node_modules, and --ignore-scripts stops untrusted install scripts
+        # (e.g. from a PR) from executing inside the scan job.
+        if: contains(fromJSON('["all","sca"]'), inputs.scan_type || 'all')
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+
+          if [ ! -f package.json ]; then
+            echo "No package.json at repo root; skipping."
+            exit 0
+          fi
+          for lock in package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml; do
+            if [ -f "$lock" ]; then
+              echo "Found $lock; using the committed lockfile."
+              exit 0
+            fi
+          done
+
+          echo "package.json found without a lockfile; generating package-lock.json."
+          if ! command -v npm >/dev/null 2>&1; then
+            if command -v apt-get >/dev/null 2>&1; then
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends nodejs npm
+            else
+              echo "::warning::npm is not available and cannot be installed in this image - SCA will fall back to package.json ranges only."
+              exit 0
+            fi
+          fi
+          node --version
+          npm --version
+
+          if npm install --package-lock-only --ignore-scripts --no-audit --no-fund; then
+            echo "Generated package-lock.json"
+          else
+            echo "::warning::npm install failed - SCA will fall back to package.json ranges only."
+          fi
 
       - name: Run TigerGate scan
         id: scan
