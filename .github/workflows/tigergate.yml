@@ -1,0 +1,181 @@
+# TigerGate security scan.
+#
+# Runs the TigerGate CLI container against this repository and uploads the
+# results to the TigerGate staging environment.
+#
+# This workflow only scans the repository as checked out: it does not install
+# dependencies, build, or provision any language toolchain. SCA reads the
+# committed manifests (package.json / package-lock.json) directly.
+#
+# The CLI image is fully driven by workflow inputs (cli_image / cli_tag), so a
+# custom or private build can be tested by dispatching with different values --
+# no edit to this file required. On push/PR the inputs are absent, so every
+# expression below falls back to a repo variable and then a literal default.
+name: TigerGate Security Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      cli_image:
+        description: "TigerGate CLI image (without tag)"
+        type: string
+        required: true
+        default: tigergate/tigergate-cli
+      cli_tag:
+        description: "TigerGate CLI image tag"
+        type: string
+        required: true
+        default: latest
+      scan_type:
+        description: "Scan type to run"
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - sast
+          - sca
+          - secrets
+          - iac
+      quality_gate:
+        description: "Enforce the quality gate (fails the job when the gate fails)"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: write
+
+# A newer push supersedes an in-flight scan of the same ref.
+concurrency:
+  group: tigergate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: TigerGate ${{ inputs.scan_type || 'all' }} scan
+    runs-on: ubuntu-latest
+
+    # The whole job runs inside the selected TigerGate CLI image.
+    # NOTE: `inputs` is null on push/pull_request, so each value falls back to a
+    # repo variable (Settings -> Variables) and then to a literal. Without this
+    # the image would resolve to a bare ":" and the job would fail to start.
+    container:
+      image: ${{ inputs.cli_image || vars.TIGERGATE_CLI_IMAGE || 'tigergate/tigergate-cli' }}:${{ inputs.cli_tag || vars.TIGERGATE_CLI_TAG || 'latest' }}
+      # The image declares ENTRYPOINT ["tigergate"]. GitHub Actions overrides the
+      # entrypoint itself to keep the container alive and then execs each step in
+      # a shell, so no `options: --entrypoint` override is needed here.
+
+    env:
+      TIGERGATE_API_KEY: ${{ secrets.TIGERGATE_API_KEY }}
+      TIGERGATE_API_URL: ${{ vars.TIGERGATE_API_URL || 'https://api.staging.tigergate.dev' }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SCAN_TYPE: ${{ inputs.scan_type || 'all' }}
+      QUALITY_GATE: ${{ inputs.quality_gate || false }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history: the scanner reads git metadata, and --scan-scope full
+          # plus any diff/baseline logic needs more than a shallow clone.
+          fetch-depth: 0
+
+      - name: Configure git safe.directory
+        # The container runs as root while the workspace is checked out by the
+        # runner user, so git refuses to operate on it ("dubious ownership")
+        # until the path is explicitly trusted.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory '*'
+          git -C "$GITHUB_WORKSPACE" rev-parse --short HEAD
+
+      - name: TigerGate CLI version
+        # Printed before the scan so the exact CLI build under test is recorded
+        # in the job log.
+        run: tigergate --version
+
+      - name: Run TigerGate scan
+        id: scan
+        run: |
+          set -o pipefail
+          tigergate scan \
+            --type "$SCAN_TYPE" \
+            --scan-scope full \
+            --upload \
+            --quality-gate="$QUALITY_GATE" \
+            2>&1 | tee /tmp/tigergate-scan.log
+
+      - name: Scan result
+        if: always()
+        run: |
+          LOG=/tmp/tigergate-scan.log
+
+          # Resolve one reported value. Uses the scan step's output first (for CLI
+          # builds that write to $GITHUB_OUTPUT), otherwise scans the captured log
+          # for the given label patterns. mode controls how the value is cut out of
+          # the matched text: num = trailing integer, url = the URL itself (never
+          # split on its own ":"), str = whatever follows the label separator.
+          extract() {
+            mode="$1"; preset="$2"; shift 2
+            if [ -n "$preset" ]; then printf '%s\n' "$preset"; return; fi
+            [ -f "$LOG" ] || { echo "n/a"; return; }
+            for pat in "$@"; do
+              m=$(grep -aioE "$pat" "$LOG" | tail -1)
+              [ -n "$m" ] || continue
+              case "$mode" in
+                num) v=$(printf '%s' "$m" | grep -oE '[0-9]+' | tail -1) ;;
+                url) v=$(printf '%s' "$m" | grep -oE 'https?://[^[:space:]"]+') ;;
+                *)   v=$(printf '%s' "$m" | sed -E 's/.*[:=][[:space:]]*//') ;;
+              esac
+              v=$(printf '%s' "$v" | sed -E 's/\x1b\[[0-9;]*m//g; s/^[[:space:]]+//; s/[[:space:]]+$//')
+              [ -n "$v" ] && { printf '%s\n' "$v"; return; }
+            done
+            echo "n/a"
+          }
+
+          SCAN_ID=$(extract  str "${{ steps.scan.outputs.scan_id }}"        'scan[ _-]?id[^A-Za-z0-9]{1,4}[A-Za-z0-9_-]+')
+          GATE=$(extract     str "${{ steps.scan.outputs.gate_status }}"    'quality[ _-]?gate[^:=]*[:=][[:space:]]*[A-Za-z]+' 'gate[ _-]?status[:=][[:space:]]*[A-Za-z]+')
+          TOTAL=$(extract    num "${{ steps.scan.outputs.total_findings }}" 'total[ _-]?findings[^0-9]{0,10}[0-9]+' 'total[^0-9a-z]{1,10}[0-9]+')
+          CRITICAL=$(extract num "${{ steps.scan.outputs.critical_count }}" 'critical[^0-9a-z]{0,10}[0-9]+')
+          HIGH=$(extract     num "${{ steps.scan.outputs.high_count }}"     'high[^0-9a-z]{0,10}[0-9]+')
+          URL=$(extract      url "${{ steps.scan.outputs.dashboard_url }}"  'https?://[^[:space:]"]*(scan|finding|dashboard|report)[^[:space:]"]*')
+
+          {
+            echo "## TigerGate scan result"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| CLI image | \`${{ inputs.cli_image || vars.TIGERGATE_CLI_IMAGE || 'tigergate/tigergate-cli' }}:${{ inputs.cli_tag || vars.TIGERGATE_CLI_TAG || 'latest' }}\` |"
+            echo "| Scan type | \`$SCAN_TYPE\` |"
+            echo "| Quality gate enforced | \`$QUALITY_GATE\` |"
+            echo "| Scan outcome | \`${{ steps.scan.outcome }}\` |"
+            echo "| Scan ID | $SCAN_ID |"
+            echo "| Gate status | $GATE |"
+            echo "| Total findings | $TOTAL |"
+            echo "| Critical | $CRITICAL |"
+            echo "| High | $HIGH |"
+            echo "| Dashboard / findings URL | $URL |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          # The value extraction above is best-effort: if this CLI build labels
+          # its summary differently, the fields read "n/a" and the raw output
+          # below is the source of truth.
+          echo
+          echo "----- raw CLI output (last 100 lines) -----"
+          if [ -f "$LOG" ]; then tail -100 "$LOG"; else echo "no scan log produced"; fi
+
+      - name: Upload scan log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tigergate-scan-log
+          path: /tmp/tigergate-scan.log
+          if-no-files-found: warn
+          retention-days: 14
